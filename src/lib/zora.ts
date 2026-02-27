@@ -1,57 +1,97 @@
-import { GraphQLClient, gql } from 'graphql-request';
+import { createPublicClient, http, parseAbi } from 'viem';
+import { base, mainnet, zora } from 'viem/chains';
 
-const endpoint = 'https://api.zora.co/graphql';
+// Setup Viem Client
+const getClient = (networkName: string) => {
+    const chain = networkName === 'zora' ? zora : networkName === 'mainnet' ? mainnet : base;
+    return createPublicClient({
+        chain,
+        transport: http()
+    });
+};
 
-const client = new GraphQLClient(endpoint);
+const ZORA_1155_ABI = parseAbi([
+    'function name() view returns (string)',
+    'function uri(uint256 tokenId) view returns (string)',
+    'function tokenURI(uint256 tokenId) view returns (string)'
+]);
 
 export const getZoraTokens = async () => {
-    // Check if we should use mock data
+    // Check if we should use mock data exclusively
     if (process.env.MOCK_ZORA_API === 'true') {
-        return getMockTokens();
+        return getMockTokens().slice(0, 6);
     }
 
-    const creatorAddress = process.env.ZORA_CREATOR_ADDRESS || '0x...'; // Replace with a default or throw
+    const contractAddress = (process.env.NEXT_PUBLIC_ZORA_CONTRACT_ADDRESS || '') as `0x${string}`;
+    const network = process.env.NEXT_PUBLIC_NETWORK || 'base';
 
-    const query = gql`
-        query GetTokens($where: TokenInput!) {
-            tokens(where: $where, sort: { sortKey: MINTED, sortDirection: DESC }, pagination: { limit: 12 }) {
-                nodes {
-                    token {
-                        collectionAddress
-                        tokenId
-                        name
-                        description
-                        image {
-                            url
-                        }
-                        mintInfo {
-                            mintContext {
-                                blockTimestamp
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    `;
+    if (!contractAddress || contractAddress.length !== 42) {
+        console.log('Invalid Zora Contract Address, returning mock data.');
+        return getMockTokens().slice(0, 6);
+    }
+
+    const client = getClient(network);
+    const tokens = [];
 
     try {
-        const data = await client.request(query, {
-            where: {
-                collectionAddresses: [creatorAddress]
+        // We will optimistically try to fetch token IDs 1 through 6
+        for (let i = BigInt(1); i <= BigInt(6); i++) {
+            let uriRaw = '';
+            try {
+                // Try ERC1155 uri() first
+                uriRaw = await client.readContract({
+                    address: contractAddress,
+                    abi: ZORA_1155_ABI,
+                    functionName: 'uri',
+                    args: [i]
+                });
+            } catch (e) {
+                try {
+                    // Try ERC721 tokenURI() fallback
+                    uriRaw = await client.readContract({
+                        address: contractAddress,
+                        abi: ZORA_1155_ABI,
+                        functionName: 'tokenURI',
+                        args: [i]
+                    });
+                } catch (err) {
+                    // Reverted, likely token doesn't exist. Stop iterating.
+                    break;
+                }
             }
-        });
 
-        const nodes = data?.tokens?.nodes;
-        if (!nodes || nodes.length === 0) {
-            console.log('No Zora tokens found, returning mock data fallback.');
-            return getMockTokens().slice(0, 3);
+            if (!uriRaw) break;
+
+            // Fetch IPFS Metadata
+            const httpUri = uriRaw.replace('ipfs://', 'https://cloudflare-ipfs.com/ipfs/');
+            try {
+                const metadata = await fetch(httpUri).then(r => r.json());
+                tokens.push({
+                    token: {
+                        collectionAddress: contractAddress,
+                        tokenId: i.toString(),
+                        name: metadata.name || `Token ${i}`,
+                        description: metadata.description || '',
+                        image: {
+                            url: metadata.image ? metadata.image.replace('ipfs://', 'https://cloudflare-ipfs.com/ipfs/') : ''
+                        }
+                    }
+                });
+            } catch (metadataErr) {
+                console.error(`Failed to fetch IPFS metadata for token ${i}`);
+            }
         }
 
-        return nodes;
+        if (tokens.length === 0) {
+            console.log('No Zora tokens found on-chain, returning mock data fallback.');
+            return getMockTokens().slice(0, 6);
+        }
+
+        return tokens.reverse(); // Newest first
+
     } catch (error) {
-        console.error('Error fetching Zora tokens, returning mock data fallback:', error);
-        return getMockTokens().slice(0, 3);
+        console.error('Error fetching Zora tokens via viem, returning mock data fallback:', error);
+        return getMockTokens().slice(0, 6);
     }
 };
 
